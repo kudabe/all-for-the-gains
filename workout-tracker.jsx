@@ -80,9 +80,26 @@ function niceDate(dateStr) {
   const label = dt.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" });
   return dateStr === today ? `Today · ${label}` : label;
 }
+function shortDate(dateStr) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
+}
 const uid = () => Math.random().toString(36).slice(2, 9);
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const fmtW = (w) => (w ? `${w}kg` : "bodyweight");
+const cloneEntries = (entries) =>
+  entries.map((e) => {
+    const { notes, ...rest } = e;
+    return { ...rest, id: uid() };
+  });
+function summarize(entries) {
+  const groups = [...new Set(entries.filter((e) => e.kind === "strength").map((e) => e.group))];
+  const c = entries.filter((e) => e.kind === "cardio").length;
+  const parts = [];
+  if (groups.length) parts.push(groups.join(", "));
+  if (c) parts.push(`${c} cardio`);
+  return parts.join(" · ") || "empty";
+}
 
 /* ---------------- storage adapter ---------------- */
 
@@ -137,6 +154,11 @@ const store = {
     return out;
   },
 };
+
+/* live sync is only available in the standalone (Supabase) build */
+function subscribeKv() {
+  return () => {};
+}
 
 /* ---------------- end storage adapter ---------------- */
 
@@ -281,16 +303,22 @@ function Sheet({ title, onClose, children, footer }) {
   );
 }
 
-/* ---------------- add strength ---------------- */
+/* ---------------- add / edit strength ---------------- */
 
-function AddStrength({ onSave, onClose }) {
+function AddStrength({ onSave, onClose, initial }) {
   const groups = Object.keys(EXERCISES);
-  const [group, setGroup] = useState(groups[0]);
-  const [exercise, setExercise] = useState("");
-  const [custom, setCustom] = useState("");
-  const [equipment, setEquipment] = useState("");
-  const [sets, setSets] = useState([{ reps: "", weight: "" }]);
-  const [notes, setNotes] = useState("");
+  const initGroup = initial?.group && EXERCISES[initial.group] ? initial.group : groups[0];
+  const isPreset = initial ? (EXERCISES[initGroup] || []).includes(initial.name) : false;
+  const [group, setGroup] = useState(initGroup);
+  const [exercise, setExercise] = useState(isPreset ? initial.name : "");
+  const [custom, setCustom] = useState(initial && !isPreset ? initial.name : "");
+  const [equipment, setEquipment] = useState(initial?.equipment || "");
+  const [sets, setSets] = useState(
+    initial
+      ? initial.sets.map((s) => ({ reps: String(s.reps), weight: s.weight == null ? "" : String(s.weight) }))
+      : [{ reps: "", weight: "" }]
+  );
+  const [notes, setNotes] = useState(initial?.notes || "");
 
   const name = custom.trim() || exercise;
   const validSets = sets.filter((s) => s.reps !== "" && Number(s.reps) > 0);
@@ -304,7 +332,7 @@ function AddStrength({ onSave, onClose }) {
 
   return (
     <Sheet
-      title="Add exercise"
+      title={initial ? "Edit exercise" : "Add exercise"}
       onClose={onClose}
       footer={
         <button
@@ -313,7 +341,7 @@ function AddStrength({ onSave, onClose }) {
           disabled={!canSave}
           onClick={() =>
             onSave({
-              id: uid(),
+              id: initial?.id || uid(),
               kind: "strength",
               group,
               name,
@@ -323,7 +351,7 @@ function AddStrength({ onSave, onClose }) {
             })
           }
         >
-          Save exercise
+          {initial ? "Save changes" : "Save exercise"}
         </button>
       }
     >
@@ -396,18 +424,23 @@ function AddStrength({ onSave, onClose }) {
   );
 }
 
-/* ---------------- add cardio ---------------- */
+/* ---------------- add / edit cardio ---------------- */
 
-function AddCardio({ onSave, onClose }) {
-  const [type, setType] = useState(CARDIO_TYPES[0].id);
-  const [stats, setStats] = useState({});
-  const [notes, setNotes] = useState("");
+function AddCardio({ onSave, onClose, initial }) {
+  const [type, setType] = useState(initial?.type || CARDIO_TYPES[0].id);
+  const [stats, setStats] = useState(() => {
+    if (!initial) return {};
+    const s = {};
+    Object.entries(initial.stats || {}).forEach(([k, v]) => (s[k] = String(v)));
+    return s;
+  });
+  const [notes, setNotes] = useState(initial?.notes || "");
   const cfgType = CARDIO_TYPES.find((t) => t.id === type);
   const hasAny = cfgType.fields.some((f) => stats[f] !== undefined && stats[f] !== "");
 
   return (
     <Sheet
-      title="Add cardio"
+      title={initial ? "Edit cardio" : "Add cardio"}
       onClose={onClose}
       footer={
         <button
@@ -419,10 +452,14 @@ function AddCardio({ onSave, onClose }) {
             cfgType.fields.forEach((f) => {
               if (stats[f] !== undefined && stats[f] !== "") clean[f] = Number(stats[f]);
             });
-            onSave({ id: uid(), kind: "cardio", type: cfgType.id, label: cfgType.label, stats: clean, notes: notes.trim() || undefined });
+            onSave({
+              id: initial?.id || uid(),
+              kind: "cardio", type: cfgType.id, label: cfgType.label,
+              stats: clean, notes: notes.trim() || undefined,
+            });
           }}
         >
-          Save session
+          {initial ? "Save changes" : "Save session"}
         </button>
       }
     >
@@ -440,7 +477,7 @@ function AddCardio({ onSave, onClose }) {
         {cfgType.fields.map((f, i) => (
           <Field
             key={f}
-            autoFocus={i === 0}
+            autoFocus={!initial && i === 0}
             label={FIELD_META[f].label}
             unit={FIELD_META[f].unit}
             value={stats[f] ?? ""}
@@ -484,15 +521,211 @@ function EditNames({ profiles, onSave, onClose }) {
   );
 }
 
+/* ---------------- quick fill: templates + recent days ---------------- */
+
+function QuickFill({ user, currentDate, onApply, onClose }) {
+  const [templates, setTemplates] = useState(null);
+  const [recent, setRecent] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const tpl = (await store.get(`templates:${user}`)) || {};
+      const keys = await store.list(`day:${user}:`);
+      const dates = keys.map((k) => k.split(":")[2]).filter((d) => d && d !== currentDate).sort().reverse().slice(0, 6);
+      const days = [];
+      for (const ds of dates) {
+        const d = await store.get(dayKey(user, ds));
+        if (d && d.entries && d.entries.length) days.push({ date: ds, entries: d.entries });
+      }
+      if (!alive) return;
+      setTemplates(tpl);
+      setRecent(days);
+    })();
+    return () => { alive = false; };
+  }, [user, currentDate]);
+
+  const deleteTemplate = async (tplName) => {
+    const next = { ...templates };
+    delete next[tplName];
+    setTemplates(next);
+    await store.set(`templates:${user}`, next);
+  };
+
+  const tplNames = templates ? Object.keys(templates) : [];
+
+  return (
+    <Sheet title="Quick fill" onClose={onClose}>
+      {templates === null ? (
+        <p className="hint">Loading…</p>
+      ) : (
+        <>
+          <p className="eyebrow">Templates</p>
+          {tplNames.length === 0 && (
+            <p className="hint">No templates yet — log a day, then tap "Save today as a template".</p>
+          )}
+          {tplNames.map((t) => (
+            <div className="list-row" key={t} onClick={() => onApply(cloneEntries(templates[t]))}>
+              <div><b>{t}</b><span>{summarize(templates[t])}</span></div>
+              <button
+                type="button" className="icon-btn dim" aria-label={`Delete template ${t}`}
+                onClick={(e) => { e.stopPropagation(); deleteTemplate(t); }}
+              >✕</button>
+            </div>
+          ))}
+
+          <p className="eyebrow">Recent days</p>
+          {recent && recent.length === 0 && <p className="hint">No previous days logged yet.</p>}
+          {recent && recent.map((r) => (
+            <div className="list-row" key={r.date} onClick={() => onApply(cloneEntries(r.entries))}>
+              <div><b>{shortDate(r.date)}</b><span>{summarize(r.entries)} · {r.entries.length} entries</span></div>
+              <span className="go">›</span>
+            </div>
+          ))}
+        </>
+      )}
+    </Sheet>
+  );
+}
+
+/* ---------------- save as template ---------------- */
+
+function SaveTemplate({ user, entries, onDone, onClose }) {
+  const [tplName, setTplName] = useState("");
+  return (
+    <Sheet
+      title="Save as template"
+      onClose={onClose}
+      footer={
+        <button
+          type="button" className="primary" disabled={!tplName.trim()}
+          onClick={async () => {
+            const key = `templates:${user}`;
+            const tpl = (await store.get(key)) || {};
+            tpl[tplName.trim()] = entries.map((e) => { const { notes, ...rest } = e; return rest; });
+            await store.set(key, tpl);
+            onDone(tplName.trim());
+          }}
+        >
+          Save template
+        </button>
+      }
+    >
+      <p className="hint" style={{ padding: "4px 0 0" }}>
+        Saves today's {entries.length} {entries.length === 1 ? "entry" : "entries"} as a reusable day you can apply from Quick fill.
+      </p>
+      <p className="eyebrow">Template name</p>
+      <input
+        className="text-input" placeholder="e.g. Push day" value={tplName} autoFocus
+        onChange={(e) => setTplName(e.target.value)}
+      />
+    </Sheet>
+  );
+}
+
+/* ---------------- exercise progress ---------------- */
+
+function LineChart({ points, unit }) {
+  if (!points.length) return null;
+  const W = 320, H = 150, P = { l: 34, r: 14, t: 14, b: 24 };
+  const vs = points.map((p) => p.v);
+  const min = Math.min(...vs), max = Math.max(...vs);
+  const span = max - min || 1;
+  const x = (i) => P.l + (W - P.l - P.r) * (points.length === 1 ? 0.5 : i / (points.length - 1));
+  const y = (v) => H - P.b - ((v - min) / span) * (H - P.t - P.b);
+  const path = points.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)} ${y(p.v).toFixed(1)}`).join(" ");
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="line">
+      <text x="2" y={y(max) + 3} fontSize="9" fill="var(--dim)">{max}{unit}</text>
+      {min !== max && <text x="2" y={y(min) + 3} fontSize="9" fill="var(--dim)">{min}{unit}</text>}
+      <path d={path} fill="none" stroke="var(--figBody)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+      {points.map((p, i) => (
+        <circle key={i} cx={x(i)} cy={y(p.v)} r={i === points.length - 1 ? 4 : 2.6}
+          fill={i === points.length - 1 ? "var(--accent)" : "var(--figBody)"} />
+      ))}
+      <text x={P.l} y={H - 6} fontSize="9" fill="var(--dim)">{points[0].label}</text>
+      {points.length > 1 && (
+        <text x={W - P.r} y={H - 6} fontSize="9" fill="var(--dim)" textAnchor="end">{points[points.length - 1].label}</text>
+      )}
+    </svg>
+  );
+}
+
+function Progress({ user, name, onClose }) {
+  const [sessions, setSessions] = useState(null);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const all = await store.getMany(`day:${user}:`);
+      if (!alive) return;
+      const rows = [];
+      Object.entries(all)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .forEach(([k, dayV]) => {
+          const ds = k.split(":")[2];
+          (dayV.entries || []).forEach((e) => {
+            if (e.kind === "strength" && e.name === name) {
+              let top = { weight: 0, reps: 0 };
+              e.sets.forEach((s) => {
+                const w = s.weight || 0;
+                if (w > top.weight || (w === top.weight && s.reps > top.reps)) top = { weight: w, reps: s.reps };
+              });
+              rows.push({ date: ds, ...top, sets: e.sets.length });
+            }
+          });
+        });
+      setSessions(rows);
+    })();
+    return () => { alive = false; };
+  }, [user, name]);
+
+  const weighted = sessions ? sessions.some((s) => s.weight > 0) : false;
+  const points = (sessions || []).slice(-12).map((s) => {
+    const [, m, d] = s.date.split("-");
+    return { label: `${Number(d)}/${Number(m)}`, v: weighted ? s.weight : s.reps };
+  });
+
+  return (
+    <Sheet title={name} onClose={onClose}>
+      {sessions === null ? (
+        <p className="hint">Loading…</p>
+      ) : sessions.length === 0 ? (
+        <p className="hint">No sessions logged for this exercise yet.</p>
+      ) : (
+        <>
+          <p className="eyebrow">{weighted ? "Top weight per session · kg" : "Top reps per session"}</p>
+          {sessions.length === 1 ? (
+            <p className="hint">One session so far — the line appears from the second one. First mark: {sessions[0].reps}×{fmtW(sessions[0].weight)}.</p>
+          ) : (
+            <LineChart points={points} unit={weighted ? "kg" : ""} />
+          )}
+          <p className="eyebrow">Recent sessions</p>
+          {sessions.slice(-5).reverse().map((s, i) => (
+            <p className="pb-line" key={i}>
+              <b>{shortDate(s.date)}</b> — {s.sets} {s.sets === 1 ? "set" : "sets"}, top {s.reps}×{fmtW(s.weight)}
+            </p>
+          ))}
+        </>
+      )}
+    </Sheet>
+  );
+}
+
 /* ---------------- entry cards ---------------- */
 
-function EntryCard({ entry, onDelete }) {
+function EntryCard({ entry, onDelete, onEdit, onProgress }) {
   if (entry.kind === "strength") {
     return (
-      <div className="card">
+      <div className="card tap" onClick={onEdit}>
         <div className="card-top">
           <span className="eyebrow">{entry.group} · {entry.equipment}</span>
-          <button type="button" className="icon-btn dim" onClick={onDelete} aria-label="Delete entry">✕</button>
+          <span className="card-actions">
+            <button type="button" className="icon-btn dim" aria-label={`Progress for ${entry.name}`}
+              onClick={(e) => { e.stopPropagation(); onProgress(entry.name); }}>📈</button>
+            <button type="button" className="icon-btn dim" aria-label="Delete entry"
+              onClick={(e) => { e.stopPropagation(); onDelete(); }}>✕</button>
+          </span>
         </div>
         <h3>{entry.name}</h3>
         <p className="sets-line">
@@ -505,10 +738,11 @@ function EntryCard({ entry, onDelete }) {
     );
   }
   return (
-    <div className="card">
+    <div className="card tap" onClick={onEdit}>
       <div className="card-top">
         <span className="eyebrow">Cardio</span>
-        <button type="button" className="icon-btn dim" onClick={onDelete} aria-label="Delete entry">✕</button>
+        <button type="button" className="icon-btn dim" aria-label="Delete entry"
+          onClick={(e) => { e.stopPropagation(); onDelete(); }}>✕</button>
       </div>
       <h3>{entry.label}</h3>
       <div className="stat-row">
@@ -648,6 +882,14 @@ function SparkleArt() {
   );
 }
 
+function Heart() {
+  return (
+    <svg className="heart" viewBox="0 0 10 9" aria-hidden="true">
+      <path d="M5 8.2 C1.2 5.4 0.2 3.2 1.6 1.7 C2.8 0.5 4.3 1 5 2.1 C5.7 1 7.2 0.5 8.4 1.7 C9.8 3.2 8.8 5.4 5 8.2 Z" fill="#EF5B7B" />
+    </svg>
+  );
+}
+
 /* ---------------- app ---------------- */
 
 export default function AllForTheGains() {
@@ -704,6 +946,25 @@ export default function AllForTheGains() {
     return () => document.removeEventListener("visibilitychange", onVis);
   }, [user, dateStr, refreshDots, loadDay]);
 
+  /* live sync (active in the Supabase build) */
+  useEffect(() => {
+    const unsub = subscribeKv((key, value) => {
+      if (key === "profiles" && value && value.p1 && value.p2) { setProfiles(value); return; }
+      if (key && key.startsWith("day:")) {
+        setLogged((prev) => {
+          const s = new Set(prev);
+          if (value && (value.rest || (value.entries && value.entries.length))) s.add(key);
+          else s.delete(key);
+          return s;
+        });
+        if (key === dayKey(user, dateStr)) {
+          setDay(value && Array.isArray(value.entries) ? value : EMPTY_DAY);
+        }
+      }
+    });
+    return unsub;
+  }, [user, dateStr]);
+
   useEffect(() => {
     document.body.style.transition = "background-color .35s";
     document.body.style.backgroundColor = user === "p2" ? "#FBE4EE" : "#0B1822";
@@ -740,7 +1001,6 @@ export default function AllForTheGains() {
           if (e.kind === "strength") {
             setsN += e.sets.length;
             e.sets.forEach((s) => (vol += s.reps * (s.weight || 0)));
-            cal += 0;
           } else {
             cSess++;
             cMin += e.stats.duration || 0;
@@ -811,7 +1071,7 @@ export default function AllForTheGains() {
         const distV = entry.stats.distance || 0;
         const betterDist = distV > 0 && prev && distV > (prev.distance || 0);
         const betterDur = dur > 0 && prev && dur > (prev.duration || 0) && !(prev.distance > 0 && distV > 0);
-        if (!prev || betterDist || betterDur || dur > (prev?.duration || 0) || distV > (prev?.distance || 0)) {
+        if (!prev || dur > (prev.duration || 0) || distV > (prev.distance || 0)) {
           prs[k] = {
             duration: Math.max(dur, prev?.duration || 0),
             distance: Math.max(distV, prev?.distance || 0),
@@ -836,13 +1096,21 @@ export default function AllForTheGains() {
     } catch {}
   }
 
-  const addEntry = (entry) => {
-    saveDay({ ...day, entries: [...day.entries, entry] });
+  const upsertEntry = (entry) => {
+    const exists = day.entries.some((e) => e.id === entry.id);
+    saveDay({
+      ...day,
+      entries: exists ? day.entries.map((e) => (e.id === entry.id ? entry : e)) : [...day.entries, entry],
+    });
     setSheet(null);
     checkPR(entry);
   };
   const deleteEntry = (id) => saveDay({ ...day, entries: day.entries.filter((e) => e.id !== id) });
   const toggleRest = () => saveDay({ ...day, rest: !day.rest });
+  const applyEntries = (clones) => {
+    saveDay({ ...day, entries: [...day.entries, ...clones] });
+    setSheet(null);
+  };
 
   const days = weekDays(anchor);
   const shiftWeek = (n) => setAnchor((prev) => { const d = new Date(prev); d.setDate(d.getDate() + 7 * n); return d; });
@@ -863,7 +1131,7 @@ export default function AllForTheGains() {
               {profiles[p]}
             </Chip>
           ))}
-          <button type="button" className="icon-btn dim" onClick={() => setSheet("names")} aria-label="Edit names">✎</button>
+          <button type="button" className="icon-btn dim" onClick={() => setSheet({ type: "names" })} aria-label="Edit names">✎</button>
         </div>
       </header>
 
@@ -890,6 +1158,8 @@ export default function AllForTheGains() {
                 const s = ymd(d);
                 const isSel = s === dateStr;
                 const isToday = s === ymd(new Date());
+                const has1 = logged.has(dayKey("p1", s));
+                const has2 = logged.has(dayKey("p2", s));
                 return (
                   <button
                     type="button"
@@ -900,8 +1170,9 @@ export default function AllForTheGains() {
                     <span className="dw">{d.toLocaleDateString("en-GB", { weekday: "short" }).slice(0, 2)}</span>
                     <span className="dn">{d.getDate()}</span>
                     <span className="marks">
-                      <i style={{ background: logged.has(dayKey("p1", s)) ? PERSON_COLOR.p1 : "transparent" }} />
-                      <i style={{ background: logged.has(dayKey("p2", s)) ? PERSON_COLOR.p2 : "transparent" }} />
+                      <i style={{ background: has1 ? PERSON_COLOR.p1 : "transparent" }} />
+                      {has1 && has2 && <Heart />}
+                      <i style={{ background: has2 ? PERSON_COLOR.p2 : "transparent" }} />
                     </span>
                   </button>
                 );
@@ -932,21 +1203,38 @@ export default function AllForTheGains() {
                 )}
 
                 {day.entries.map((e) => (
-                  <EntryCard key={e.id} entry={e} onDelete={() => deleteEntry(e.id)} />
+                  <EntryCard
+                    key={e.id}
+                    entry={e}
+                    onDelete={() => deleteEntry(e.id)}
+                    onEdit={() => setSheet({ type: e.kind === "strength" ? "strength" : "cardio", entry: e })}
+                    onProgress={(exName) => setSheet({ type: "progress", name: exName })}
+                  />
                 ))}
 
                 {!day.rest && day.entries.length === 0 && (
-                  <p className="hint">
-                    Nothing logged for {profiles[user]} yet. Add an exercise or a cardio session below — or mark it a rest day.
-                  </p>
+                  <>
+                    <button type="button" className="ghost" onClick={() => setSheet({ type: "quick" })}>
+                      ↻ Repeat a day or template
+                    </button>
+                    <p className="hint">
+                      Nothing logged for {profiles[user]} yet. Add an exercise or a cardio session below — or mark it a rest day.
+                    </p>
+                  </>
+                )}
+
+                {day.entries.length > 0 && (
+                  <button type="button" className="ghost" onClick={() => setSheet({ type: "saveTpl" })}>
+                    Save today as a template
+                  </button>
                 )}
               </>
             )}
           </main>
 
           <div className="add-bar">
-            <button type="button" className="primary" onClick={() => setSheet("strength")}>+ Exercise</button>
-            <button type="button" className="secondary" onClick={() => setSheet("cardio")}>+ Cardio</button>
+            <button type="button" className="primary" onClick={() => setSheet({ type: "strength" })}>+ Exercise</button>
+            <button type="button" className="secondary" onClick={() => setSheet({ type: "cardio" })}>+ Cardio</button>
           </div>
         </>
       )}
@@ -1004,9 +1292,12 @@ export default function AllForTheGains() {
         </main>
       )}
 
-      {sheet === "strength" && <AddStrength onSave={addEntry} onClose={() => setSheet(null)} />}
-      {sheet === "cardio" && <AddCardio onSave={addEntry} onClose={() => setSheet(null)} />}
-      {sheet === "names" && (
+      {sheet?.type === "strength" && <AddStrength initial={sheet.entry} onSave={upsertEntry} onClose={() => setSheet(null)} />}
+      {sheet?.type === "cardio" && <AddCardio initial={sheet.entry} onSave={upsertEntry} onClose={() => setSheet(null)} />}
+      {sheet?.type === "quick" && <QuickFill user={user} currentDate={dateStr} onApply={applyEntries} onClose={() => setSheet(null)} />}
+      {sheet?.type === "saveTpl" && <SaveTemplate user={user} entries={day.entries} onDone={() => setSheet(null)} onClose={() => setSheet(null)} />}
+      {sheet?.type === "progress" && <Progress user={user} name={sheet.name} onClose={() => setSheet(null)} />}
+      {sheet?.type === "names" && (
         <EditNames
           profiles={profiles}
           onClose={() => setSheet(null)}
@@ -1108,8 +1399,9 @@ header{display:flex; flex-direction:column; gap:12px; margin-bottom:10px}
 .day.today .dn{color:var(--accent)}
 .day.sel{border-bottom-color:var(--accent)}
 .day.sel .dw{color:var(--accent)}
-.marks{display:flex; gap:3px; height:5px}
+.marks{display:flex; gap:3px; height:8px; align-items:center}
 .marks i{width:5px; height:5px; border-radius:50%}
+.heart{width:8px; height:7px; display:block}
 
 /* day view */
 .day-head{display:flex; justify-content:space-between; align-items:baseline; gap:10px; margin-bottom:14px}
@@ -1130,7 +1422,9 @@ header{display:flex; flex-direction:column; gap:12px; margin-bottom:10px}
 
 /* cards */
 .card{background:var(--panel2); border:1px solid var(--line); border-radius:14px; padding:14px 16px; margin-bottom:10px; transition:background-color .35s, border-color .35s}
+.card.tap{cursor:pointer}
 .card-top{display:flex; justify-content:space-between; align-items:center; margin-bottom:2px}
+.card-actions{display:flex; align-items:center; gap:2px}
 .card h3{font-family:'DM Serif Display',serif; font-weight:400; font-size:19px; margin:2px 0 8px}
 .eyebrow{font-size:10.5px; letter-spacing:.18em; text-transform:uppercase; color:var(--accent); font-weight:500}
 .sets-line{display:flex; flex-wrap:wrap; gap:6px 14px; font-size:15px}
@@ -1141,12 +1435,22 @@ header{display:flex; flex-direction:column; gap:12px; margin-bottom:10px}
 .stat i{font-style:normal; color:var(--dim); font-size:12px}
 .note{color:var(--dim); font-size:13px; font-style:italic; margin-top:8px; line-height:1.5}
 
+/* quick fill lists */
+.list-row{
+  display:flex; justify-content:space-between; align-items:center; gap:8px;
+  padding:12px 4px; border-bottom:1px solid var(--line); cursor:pointer;
+}
+.list-row b{font-weight:500; font-size:14.5px; display:block}
+.list-row span{color:var(--dim); font-size:12.5px}
+.list-row .go{color:var(--dim); font-size:18px}
+
 /* report */
 .tiles{display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:10px}
 .tile{background:var(--panel2); border:1px solid var(--line); border-radius:12px; padding:10px 6px; text-align:center}
 .tile b{font-family:'DM Serif Display',serif; font-weight:400; font-size:21px; display:block}
 .tile span{font-size:10px; color:var(--dim); letter-spacing:.1em; text-transform:uppercase}
 .bars{width:100%; height:auto; margin-top:8px; display:block}
+.line{width:100%; height:auto; margin-top:8px; display:block}
 .pb-line{font-size:14px; margin-top:8px; line-height:1.5}
 .pb-line b{font-weight:500}
 .pb-line i{font-style:normal; color:var(--dim); font-size:12px}
@@ -1182,7 +1486,7 @@ header{display:flex; flex-direction:column; gap:12px; margin-bottom:10px}
   border-radius:12px; padding:13px; font-weight:500; font-size:15px;
   transition:background-color .35s, color .2s;
 }
-.ghost{background:none; border:1px dashed var(--line); color:var(--dim); border-radius:10px; padding:9px; width:100%}
+.ghost{background:none; border:1px dashed var(--line); color:var(--dim); border-radius:10px; padding:10px; width:100%; margin-top:2px}
 .icon-btn{background:none; border:none; color:var(--text); font-size:16px; padding:6px 8px; border-radius:8px}
 .icon-btn.dim{color:var(--dim); font-size:13px}
 
